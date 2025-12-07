@@ -209,6 +209,7 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                                 let _ = tx.send(ProxyEvent::Log(format!("TCP write error: {}", e)));
                                 break;
                             }
+                            let _ = tcp_write.flush();
                         }
                     },
                     Err(e) => {
@@ -250,6 +251,7 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                                 let _ = tx.send(ProxyEvent::Log(format!("WebSocket send error: {}", e)));
                                 break;
                             }
+                            let _ = ws_write.flush();
                         }
                     }
                     Err(e) => {
