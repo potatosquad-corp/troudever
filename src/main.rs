@@ -182,7 +182,12 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
         tcp_addr
     )));
     let tcp_stream = match TcpStream::connect(&tcp_addr).await {
-        Ok(s) => s,
+        Ok(s) => {
+            if let Err(e) = s.set_nodelay(true) {
+            let _ = tx.send(ProxyEvent::Log(format!("Warning: Failed to set TCP_NODELAY: {}", e)));
+            }
+            s
+        },
         Err(e) => {
             let _ = tx.send(ProxyEvent::Log(format!("TCP connection failed: {}", e)));
             return;
@@ -195,7 +200,7 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-    let mut tcp_buffer = [0u8; 4096];
+    let mut tcp_buffer = [0u8; 1_048_576];
 
     loop {
         tokio::select! {
