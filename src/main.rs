@@ -200,7 +200,7 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-    let mut tcp_buffer = [0u8; 1_048_576];
+    let mut tcp_buffer = vec![0u8; 1_048_576];
 
     loop {
         tokio::select! {
