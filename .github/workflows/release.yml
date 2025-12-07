@@ -1,58 +1,81 @@
-name: Deploy Troudever Release
+name: Build and Release Troudever
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: 
 
 permissions:
   contents: write
 
 jobs:
-  check-and-release:
-    name: release ${{ matrix.target }}
-    runs-on: ubuntu-latest
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-pc-windows-gnu
-            archive: zip
-          - target: x86_64-unknown-linux-musl
-            archive: tar.gz tar.xz tar.zst
-          - target: x86_64-apple-darwin
-            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: troudever
+            asset_name: troudever-linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: troudever.exe
+            asset_name: troudever-windows-amd64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: troudever
+            asset_name: troudever-macos-amd64
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Get version from Cargo.toml
-        id: get_version
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
-          VERSION=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
-          echo "Detected version: $VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libssl-dev pkg-config
 
-      - name: Check if tag exists
-        id: check_tag
-        run: |
-          TAG="v${{ steps.get_version.outputs.version }}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists."
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "Tag $TAG does not exist. Proceeding with release."
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Compile and release
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: rust-build/rust-build.action@v1.4.5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          RUSTTARGET: ${{ matrix.target }}
-          ARCHIVE_TYPES: ${{ matrix.archive }}
-          TOOLCHAIN_VERSION: stable
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename Binary
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            troudever-linux-amd64/troudever-linux-amd64
+            troudever-windows-amd64.exe/troudever-windows-amd64.exe
+            troudever-macos-amd64/troudever-macos-amd64
+          generate_release_notes: true
