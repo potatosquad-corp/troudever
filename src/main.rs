@@ -184,10 +184,13 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
     let tcp_stream = match TcpStream::connect(&tcp_addr).await {
         Ok(s) => {
             if let Err(e) = s.set_nodelay(true) {
-            let _ = tx.send(ProxyEvent::Log(format!("Warning: Failed to set TCP_NODELAY: {}", e)));
+                let _ = tx.send(ProxyEvent::Log(format!(
+                    "Warning: Failed to set TCP_NODELAY: {}",
+                    e
+                )));
             }
             s
-        },
+        }
         Err(e) => {
             let _ = tx.send(ProxyEvent::Log(format!("TCP connection failed: {}", e)));
             return;
@@ -210,11 +213,20 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                     Ok(message) => {
                         let data = message.into_data();
                         if !data.is_empty() {
-                            if let Err(e) = tcp_write.write_all(&data).await {
-                                let _ = tx.send(ProxyEvent::Log(format!("TCP write error: {}", e)));
+                            let len = data.len() as u32;
+                            let len_bytes = len.to_be_bytes();
+
+                            if let Err(e) = tcp_write.write_all(&len_bytes).await {
+                                let _ = tx.send(ProxyEvent::Log(format!("TCP write len error: {}", e)));
                                 break;
                             }
-                            let _ = tcp_write.flush();
+
+                            if let Err(e) = tcp_write.write_all(&data).await {
+                                let _ = tx.send(ProxyEvent::Log(format!("TCP write data error: {}", e)));
+                                break;
+                            }
+
+                            let _ = tcp_write.flush().await;
                         }
                     },
                     Err(e) => {
@@ -251,7 +263,7 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                                 Ok(text) => Message::Text(text.to_string().into()),
                                 Err(_) => Message::Binary(data_chunk.to_vec().into()),
                             };
-    
+
                             if let Err(e) = ws_write.send(ws_message).await {
                                 let _ = tx.send(ProxyEvent::Log(format!("WebSocket send error: {}", e)));
                                 break;
