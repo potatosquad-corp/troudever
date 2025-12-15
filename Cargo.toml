@@ -1,6 +1,6 @@
 [package]
 name = "troudever"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -10,5 +10,5 @@ futures-util = "0.3"
 url = "2.5"
 chrono = "0.4" 
 crossbeam-channel = "0.5"
-eframe = "0.33.2"
+eframe = "0.33.3"
 serde_json ={ version = "1.0"}

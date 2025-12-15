@@ -2,6 +2,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -18,6 +19,7 @@ struct TrouDeVerApp {
     // Configuration
     ws_url: String,
     tcp_addr: String,
+    auto_reconnect: bool, // Nouvelle option UI
 
     // State
     is_running: bool,
@@ -37,6 +39,7 @@ impl Default for TrouDeVerApp {
         Self {
             ws_url: "ws://localhost:4455".to_owned(),
             tcp_addr: "127.0.0.1:9000".to_owned(),
+            auto_reconnect: true,
             is_running: false,
             room_number: None,
             status_msg: "Ready".to_owned(),
@@ -84,6 +87,7 @@ impl eframe::App for TrouDeVerApp {
                     ui.label("TCP Server:");
                     ui.text_edit_singleline(&mut self.tcp_addr);
                 });
+                ui.checkbox(&mut self.auto_reconnect, "Auto Reconnect");
             });
 
             ui.add_space(10.0);
@@ -131,9 +135,35 @@ impl TrouDeVerApp {
         let ws_url = self.ws_url.clone();
         let tcp_addr = self.tcp_addr.clone();
         let tx = self.tx_event.clone();
+        let auto_reconnect = self.auto_reconnect;
+        
+        let initial_room = self.room_number.clone();
 
         let handle = tokio::spawn(async move {
-            run_proxy_logic(ws_url, tcp_addr, tx.clone()).await;
+            let mut current_room = initial_room;
+
+            loop {
+                let last_room = run_proxy_logic(
+                    ws_url.clone(), 
+                    tcp_addr.clone(), 
+                    tx.clone(), 
+                    current_room.clone()
+                ).await;
+
+                if last_room.is_some() {
+                    current_room = last_room;
+                }
+
+                if !auto_reconnect {
+                    break;
+                }
+                
+                let _ = tx.send(ProxyEvent::Status("Connection lost. Retrying in 3s...".to_string()));
+                let _ = tx.send(ProxyEvent::Log("Reconnecting in 3 seconds...".to_string()));
+                
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+
             let _ = tx.send(ProxyEvent::Stopped);
         });
 
@@ -147,63 +177,72 @@ impl TrouDeVerApp {
         }
         self.proxy_abort = None;
         self.is_running = false;
-        self.status_msg = "Stopping...".to_string();
+        self.status_msg = "Stopped".to_string();
     }
 }
 
-async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent>) {
-    let _ = tx.send(ProxyEvent::Log(format!(
-        "Connecting to WebSocket at {}...",
-        ws_url
-    )));
-
+async fn run_proxy_logic(
+    ws_url: String, 
+    tcp_addr: String, 
+    tx: Sender<ProxyEvent>,
+    room_code: Option<String>
+) -> Option<String> {
+    
+    let _ = tx.send(ProxyEvent::Log(format!("Connecting to WebSocket at {}...", ws_url)));
     let url = match Url::parse(&ws_url) {
         Ok(u) => u,
         Err(e) => {
             let _ = tx.send(ProxyEvent::Log(format!("Invalid URL: {}", e)));
-            return;
+            return room_code;
         }
     };
 
     let ws_stream = match connect_async(url.as_str()).await {
         Ok((ws, _)) => ws,
         Err(e) => {
-            let _ = tx.send(ProxyEvent::Log(format!(
-                "WebSocket connection failed: {}",
-                e
-            )));
-            return;
+            let _ = tx.send(ProxyEvent::Log(format!("WebSocket failed: {}", e)));
+            return room_code;
         }
     };
     let _ = tx.send(ProxyEvent::Log("[OK] WebSocket Connected".to_string()));
 
-    let _ = tx.send(ProxyEvent::Log(format!(
-        "Connecting to TCP Server at {}...",
-        tcp_addr
-    )));
-    let tcp_stream = match TcpStream::connect(&tcp_addr).await {
+    let _ = tx.send(ProxyEvent::Log(format!("Connecting to TCP Server at {}...", tcp_addr)));
+    let mut tcp_stream = match TcpStream::connect(&tcp_addr).await {
         Ok(s) => {
             if let Err(e) = s.set_nodelay(true) {
-                let _ = tx.send(ProxyEvent::Log(format!(
-                    "Warning: Failed to set TCP_NODELAY: {}",
-                    e
-                )));
+                let _ = tx.send(ProxyEvent::Log(format!("Warning: Failed to set TCP_NODELAY: {}", e)));
             }
             s
         }
         Err(e) => {
             let _ = tx.send(ProxyEvent::Log(format!("TCP connection failed: {}", e)));
-            return;
+            return room_code;
         }
     };
-    let _ = tx.send(ProxyEvent::Log(
-        "[OK] TCP Connected. Tunnel active.".to_string(),
-    ));
+
+    if let Some(code) = &room_code {
+        let _ = tx.send(ProxyEvent::Log(format!("Attempting to resume session for Room: {}", code)));
+        let handshake_json = serde_json::json!({
+            "request_room": code
+        });
+        let handshake_bytes = handshake_json.to_string().into_bytes();
+        let len = handshake_bytes.len() as u32;
+        
+        if tcp_stream.write_all(&len.to_be_bytes()).await.is_err() || 
+           tcp_stream.write_all(&handshake_bytes).await.is_err() {
+            let _ = tx.send(ProxyEvent::Log("Failed to send Handshake".to_string()));
+             return room_code;
+        }
+    }
+
+    let _ = tx.send(ProxyEvent::Log("[OK] TCP Connected. Tunnel active.".to_string()));
     let _ = tx.send(ProxyEvent::Status("Connected (Active)".to_string()));
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
     let mut tcp_buffer = vec![0u8; 1_048_576];
+
+    let mut current_known_room = room_code;
 
     loop {
         tokio::select! {
@@ -216,16 +255,11 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                             let len = data.len() as u32;
                             let len_bytes = len.to_be_bytes();
 
-                            if let Err(e) = tcp_write.write_all(&len_bytes).await {
-                                let _ = tx.send(ProxyEvent::Log(format!("TCP write len error: {}", e)));
+                            if tcp_write.write_all(&len_bytes).await.is_err() || 
+                               tcp_write.write_all(&data).await.is_err() {
+                                let _ = tx.send(ProxyEvent::Log("TCP write error".to_string()));
                                 break;
                             }
-
-                            if let Err(e) = tcp_write.write_all(&data).await {
-                                let _ = tx.send(ProxyEvent::Log(format!("TCP write data error: {}", e)));
-                                break;
-                            }
-
                             let _ = tcp_write.flush().await;
                         }
                     },
@@ -236,7 +270,6 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                 }
             }
 
-            // TCP -> WebSocket
             result = tcp_read.read(&mut tcp_buffer) => {
                 match result {
                     Ok(0) => {
@@ -245,19 +278,24 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
                     }
                     Ok(n) => {
                         let data_chunk = &tcp_buffer[0..n];
+                        
                         let stream = serde_json::Deserializer::from_slice(&data_chunk).into_iter::<Value>();
                         let mut forward_message = true;
+                        
                         for json in stream {
                             if let Ok(value) = json {
                                 if let Some(_) = value.get("internal") {
                                     forward_message = false;
                                     if let Some(code) = value.get("room").and_then(|v| v.as_str()){
-                                        let _ = tx.send(ProxyEvent::RoomCode(code.to_string()));
-                                        let _ = tx.send(ProxyEvent::Log(format!("Room ID reçue: {}", code)));
+                                        let code_str = code.to_string();
+                                        let _ = tx.send(ProxyEvent::RoomCode(code_str.clone()));
+                                        let _ = tx.send(ProxyEvent::Log(format!("Room ID confirmed: {}", code_str)));
+                                        current_known_room = Some(code_str);
                                     }
                                 }
                             }
                         }
+
                         if forward_message {
                             let ws_message = match std::str::from_utf8(data_chunk) {
                                 Ok(text) => Message::Text(text.to_string().into()),
@@ -279,12 +317,14 @@ async fn run_proxy_logic(ws_url: String, tcp_addr: String, tx: Sender<ProxyEvent
             }
         }
     }
+    
+    current_known_room
 }
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([400.0, 500.0]),
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([400.0, 550.0]),
         ..Default::default()
     };
 
